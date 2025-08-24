@@ -1,9 +1,5 @@
 package adamw
 
-import (
-	"runtime"
-)
-
 // OptimizationStrategy represents different optimization strategies
 type OptimizationStrategy int
 
@@ -22,11 +18,6 @@ type AdaptiveConfig struct {
 	SmallVectorThreshold int // < this size: use StrategyPureBLAS
 	LargeVectorThreshold int // >= this size: use StrategyHeavyFusion
 
-	// Architecture-specific settings
-	HasAVX2   bool
-	HasAVX512 bool
-	NumCores  int
-
 	// Performance characteristics (can be measured at runtime)
 	MemoryBandwidthGBps float64
 	L3CacheSizeMB       int
@@ -37,12 +28,8 @@ func DefaultAdaptiveConfig() AdaptiveConfig {
 	return AdaptiveConfig{
 		SmallVectorThreshold: 512,  // Below this: simple BLAS operations
 		LargeVectorThreshold: 4096, // Above this: aggressive optimization
-		NumCores:             runtime.NumCPU(),
 		MemoryBandwidthGBps:  25.0, // Conservative estimate
 		L3CacheSizeMB:        16,   // Conservative estimate
-		// CPU features would be detected at runtime in a real implementation
-		HasAVX2:   false, // Would be detected via cpuid
-		HasAVX512: false, // Would be detected via cpuid
 	}
 }
 
