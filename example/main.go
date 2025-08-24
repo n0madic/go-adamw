@@ -9,7 +9,7 @@ import (
 func main() {
 	// Toy problem: minimize ||θ||^2 (gradient = 2θ), just to see the steps
 	params := []float64{0.5, -1.0, 2.0}
-	// DecayMask: disable weight decay for the second parameter (common case: bias/LayerNorm)
+	// DecayMask: apply weight decay to 1st and 3rd params, skip 2nd param (common: weights vs bias/LayerNorm)
 	mask := []bool{true, false, true}
 
 	opt, err := adamw.New(params, adamw.Options{
