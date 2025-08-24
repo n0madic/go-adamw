@@ -161,10 +161,102 @@ func stepFusion(o *Optimizer, params, grad []float64, eta, lambda, bc1, bc2 floa
 	return nil
 }
 
+// Heavy fusion kernels for maximum optimization on large vectors
+
+// fullMomentBiasFusion performs moment updates with immediate bias correction:
+// mhat[i] = (beta1*m[i] + (1-beta1)*g[i]) / bc1
+// vhat[i] = (beta2*v[i] + (1-beta2)*g[i]^2) / bc2
+// Reduces memory bandwidth by combining 4 operations into 1 pass
+func fullMomentBiasFusion(m, v, mhat, vhat, g []float64, beta1, beta2, bc1, bc2 float64) {
+	oneMinusBeta1 := 1.0 - beta1
+	oneMinusBeta2 := 1.0 - beta2
+	invBC1 := 1.0 / bc1
+	invBC2 := 1.0 / bc2
+
+	for i := range m {
+		gi := g[i]
+		gi2 := gi * gi
+
+		// Update moments and immediately apply bias correction
+		m[i] = beta1*m[i] + oneMinusBeta1*gi
+		v[i] = beta2*v[i] + oneMinusBeta2*gi2
+
+		// Bias-corrected moments ready for use
+		mhat[i] = m[i] * invBC1
+		vhat[i] = v[i] * invBC2
+	}
+}
+
+// adaptiveUpdateCompleteFusion performs bias correction + clamp + sqrt + scale + divide in one kernel:
+// result[i] = alpha * mhat[i] / (sqrt(max(vhat[i], 0)) + eps)
+// Significantly reduces memory traffic by fusing 5 operations into 1 pass
+func adaptiveUpdateCompleteFusion(update, mhat, vhat []float64, alpha, eps float64) error {
+	for i := range update {
+		// Clamp negative values (should be rare after bias correction)
+		v := vhat[i]
+		if v < 0 {
+			v = 0
+		}
+
+		denominator := math.Sqrt(v) + eps
+		if !(denominator > 0 && isFinite(denominator)) {
+			return errors.New("invalid adaptive denominator in complete fusion")
+		}
+
+		// Fused adaptive update: scale numerator and divide
+		update[i] = (alpha * mhat[i]) / denominator
+	}
+	return nil
+}
+
+// parameterUpdateFusion performs adaptive update + weight decay + parameter update in one kernel:
+// if decay: params[i] = params[i]*(1-eta*lambda) - eta*update[i]  (with optional mask)
+// else:     params[i] = params[i] - eta*update[i]
+// Reduces memory traffic by combining parameter update operations
+func parameterUpdateFusion(params, update []float64, eta, lambda float64, decayMask []bool) {
+	if lambda > 0 {
+		etaLambda := eta * lambda
+		if decayMask == nil {
+			// Uniform decay
+			oneMinusDecay := 1.0 - etaLambda
+			for i := range params {
+				params[i] = params[i]*oneMinusDecay - eta*update[i]
+			}
+		} else {
+			// Selective decay with mask
+			for i := range params {
+				if decayMask[i] {
+					params[i] = params[i]*(1.0-etaLambda) - eta*update[i]
+				} else {
+					params[i] = params[i] - eta*update[i]
+				}
+			}
+		}
+	} else {
+		// No decay - simple update
+		for i := range params {
+			params[i] = params[i] - eta*update[i]
+		}
+	}
+}
+
 // stepHeavyFusion implements StrategyHeavyFusion with maximum optimization
 func stepHeavyFusion(o *Optimizer, params, grad []float64, eta, lambda, bc1, bc2 float64) error {
-	// Same as fusion strategy for now
-	// Future: implement more aggressive fusion kernels
-	// e.g., fuse adaptive update + parameter update in one kernel
-	return stepFusion(o, params, grad, eta, lambda, bc1, bc2)
+	// Heavy fusion approach: minimize memory passes for large vectors
+
+	// Step 1: Fused moment updates with immediate bias correction
+	// This replaces both momentUpdateFusion + separate bias correction
+	fullMomentBiasFusion(o.m, o.v, o.mhat, o.vhat, grad, o.Beta1, o.Beta2, bc1, bc2)
+
+	// Step 2: Complete adaptive update fusion
+	// This replaces: clamp + sqrt + scale + divide operations
+	if err := adaptiveUpdateCompleteFusion(o.update, o.mhat, o.vhat, o.Alpha, o.Eps); err != nil {
+		return err
+	}
+
+	// Step 3: Fused parameter update with decay
+	// This replaces separate decay and parameter update operations
+	parameterUpdateFusion(params, o.update, eta, lambda, o.DecayMask)
+
+	return nil
 }
