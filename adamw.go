@@ -23,7 +23,7 @@ import (
 	"errors"
 	"math"
 
-	"gonum.org/v1/gonum/floats"
+	"gonum.org/v1/gonum/blas/blas64"
 )
 
 // Optimizer implements AdamW/AdamWR for an in-place updated parameter vector θ.
@@ -55,6 +55,10 @@ type Optimizer struct {
 
 	// Working buffers to avoid allocations
 	mhat, vhat, update, decayUpdate []float64
+
+	// Adaptive optimization configuration
+	adaptiveConfig AdaptiveConfig
+	strategy       OptimizationStrategy
 
 	initCalled bool
 }
@@ -171,20 +175,26 @@ func New(params []float64, opt Options) (*Optimizer, error) {
 		return nil, errors.New("params must be non-empty")
 	}
 
+	// Configure adaptive optimization based on vector size
+	adaptiveConfig := DefaultAdaptiveConfig()
+	strategy := SelectOptimizationStrategy(len(params), adaptiveConfig)
+
 	o := &Optimizer{
-		Alpha:       ifPositiveOr(opt.Alpha, 1e-3),
-		Beta1:       opt.Beta1,
-		Beta2:       opt.Beta2,
-		Eps:         ifPositiveOr(opt.Eps, 1e-8),
-		WeightDecay: opt.WeightDecay,
-		Norm:        opt.Norm,
-		Schedule:    opt.Schedule,
-		DecayMask:   nil,
-		t:           0,
-		powBeta1:    1.0,
-		powBeta2:    1.0,
-		m:           make([]float64, len(params)),
-		v:           make([]float64, len(params)),
+		Alpha:          ifPositiveOr(opt.Alpha, 1e-3),
+		Beta1:          opt.Beta1,
+		Beta2:          opt.Beta2,
+		Eps:            ifPositiveOr(opt.Eps, 1e-8),
+		WeightDecay:    opt.WeightDecay,
+		Norm:           opt.Norm,
+		Schedule:       opt.Schedule,
+		DecayMask:      nil,
+		adaptiveConfig: adaptiveConfig,
+		strategy:       strategy,
+		t:              0,
+		powBeta1:       1.0,
+		powBeta2:       1.0,
+		m:              make([]float64, len(params)),
+		v:              make([]float64, len(params)),
 
 		// Pre-allocate working buffers
 		mhat:        make([]float64, len(params)),
@@ -258,6 +268,30 @@ func ifPositiveOr(v, def float64) float64 {
 
 func isFinite(x float64) bool { return !math.IsNaN(x) && !math.IsInf(x, 0) }
 
+// toVector creates a blas64.Vector from a float64 slice for BLAS operations
+func toVector(data []float64) blas64.Vector {
+	return blas64.Vector{N: len(data), Data: data, Inc: 1}
+}
+
+// BLAS-optimized vector operations
+func scaleVector(alpha float64, x []float64) {
+	blas64.Scal(alpha, toVector(x))
+}
+
+func axpyVector(alpha float64, x, y []float64) {
+	// y = alpha*x + y
+	blas64.Axpy(alpha, toVector(x), toVector(y))
+}
+
+func copyVector(x, y []float64) {
+	blas64.Copy(toVector(x), toVector(y))
+}
+
+func subVector(x, y []float64) {
+	// y = y - x  (equivalent to floats.Sub(y, x))
+	axpyVector(-1.0, x, y)
+}
+
 // ---------- Main update ----------
 
 // Step performs one AdamW update on `params` using `grad`.
@@ -310,70 +344,22 @@ func (o *Optimizer) Step(params, grad []float64) error {
 
 	lambda := o.currentLambda()
 
-	// Step 1: Update moments using vectorized operations
-	// m_t = β1 * m_{t-1} + (1-β1) * g_t
-	floats.Scale(o.Beta1, o.m)
-	floats.AddScaled(o.m, 1.0-o.Beta1, grad)
-
-	// v_t = β2 * v_{t-1} + (1-β2) * g_t^2
-	// Compute g^2 into vhat temporarily, then use for v update
-	copy(o.vhat, grad)
-	for i := range o.vhat {
-		o.vhat[i] *= o.vhat[i] // g^2 in-place
+	// Adaptive strategy selection: use pre-computed strategy
+	var err error
+	switch o.strategy {
+	case StrategyPureBLAS:
+		err = stepPureBLAS(o, params, grad, eta, lambda, bc1, bc2)
+	case StrategyFusion:
+		err = stepFusion(o, params, grad, eta, lambda, bc1, bc2)
+	case StrategyHeavyFusion:
+		err = stepHeavyFusion(o, params, grad, eta, lambda, bc1, bc2)
+	default:
+		// Fallback to fusion strategy
+		err = stepFusion(o, params, grad, eta, lambda, bc1, bc2)
 	}
 
-	floats.Scale(o.Beta2, o.v)
-	floats.AddScaled(o.v, 1.0-o.Beta2, o.vhat)
-
-	// Step 2: Bias correction (fully vectorized)
-	// mhat = m / bc1, vhat = v / bc2
-	copy(o.mhat, o.m)
-	copy(o.vhat, o.v)
-	floats.Scale(1.0/bc1, o.mhat) // mhat = m / bc1
-	floats.Scale(1.0/bc2, o.vhat) // vhat = v / bc2
-
-	// Step 3: Soft clamp vhat and compute sqrt(vhat) + eps in single pass
-	for i := range o.vhat {
-		if o.vhat[i] < 0 {
-			o.vhat[i] = 0
-		}
-		o.vhat[i] = math.Sqrt(o.vhat[i]) + o.Eps
-		if !(o.vhat[i] > 0 && isFinite(o.vhat[i])) {
-			return errors.New("invalid adaptive denominator (sqrt(vhat)+eps)")
-		}
-	}
-
-	// Step 4: Compute adaptive update = alpha * mhat / (sqrt(vhat) + eps)
-	floats.Scale(o.Alpha, o.mhat) // mhat = alpha * mhat
-
-	// Vectorized element-wise division: update = mhat / vhat
-	floats.DivTo(o.update, o.mhat, o.vhat)
-
-	// Step 5: Apply updates to parameters (fully vectorized)
-	// θ <- θ - η_t * update - η_t * λ * θ (with optional DecayMask)
-	if lambda > 0 {
-		if o.DecayMask == nil {
-			// Simple case: uniform weight decay, fully vectorized
-			etaLambda := eta * lambda
-			floats.Scale(1.0-etaLambda, params)      // params *= (1 - η*λ)
-			floats.AddScaled(params, -eta, o.update) // params -= η * update
-		} else {
-			// Complex case: selective weight decay with mask
-			// Create decay vector based on mask
-			etaLambda := eta * lambda
-			for i := range o.decayUpdate {
-				if o.DecayMask[i] {
-					o.decayUpdate[i] = etaLambda * params[i]
-				} else {
-					o.decayUpdate[i] = 0
-				}
-			}
-			floats.Sub(params, o.decayUpdate)        // params -= decay_term
-			floats.AddScaled(params, -eta, o.update) // params -= η * update
-		}
-	} else {
-		// No weight decay, pure vectorized update
-		floats.AddScaled(params, -eta, o.update) // params -= eta * update
+	if err != nil {
+		return err
 	}
 
 	o.Schedule.Tick()

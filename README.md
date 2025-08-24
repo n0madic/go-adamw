@@ -10,7 +10,11 @@ AdamW / AdamWR optimizer for Go (float64 vectors) with decoupled weight decay, b
 - Schedules: fixed multiplier or cosine annealing with warm restarts.
 - Normalized weight decay (Appendix B.1) via `NormConfig`.
 - Deterministic updates; resettable state for reproducibility.
-- Gonum-optimized vectorized operations for large parameter vectors.
+- **Advanced BLAS optimization** with direct BLAS calls for improved performance.
+- **Optimized element-wise operations** for sqrt, division, and clamping.
+- **Kernel fusion** to reduce memory bandwidth requirements.
+- **Adaptive strategy selection** automatically chooses optimal implementation based on vector size.
+- **Pure Go implementation** - no external dependencies or CGO requirements.
 
 ### Install
 ```
@@ -72,17 +76,49 @@ Provide `NormConfig` in `Options` to derive λ from `λ_norm`:
 - When using warm restarts, `T` is inferred from current period and `StepsPerEpoch`.
 - Otherwise set `TotalEpochs` directly.
 
+### Performance Optimization Levels
+
+The library automatically selects the optimal optimization strategy based on vector size:
+
+#### Level 1: Direct BLAS Operations
+All vector operations use optimized BLAS calls (`blas64.Scal`, `blas64.Axpy`, etc.) instead of `floats` package:
+- Replaces 6 `floats.Scale` calls with `blas64.Scal`
+- Replaces 5 `floats.AddScaled` calls with `blas64.Axpy`
+- Universal performance improvement across all vector sizes
+
+#### Level 2: Element-wise Operations
+Critical scalar loops optimized for better performance:
+- `elementWiseSquare()`: Gradient squaring (g²)
+- `clampSqrtAddEps()`: Clamping + sqrt + epsilon addition
+- `elementWiseDivide()`: Element-wise division
+
+#### Level 3: Kernel Fusion
+Multiple operations combined into single passes to reduce memory traffic:
+- `momentUpdateFusion()`: Updates both m and v moments in one pass
+- `biasCorrectClampSqrtFusion()`: Combines bias correction + clamp + sqrt operations
+- Significant memory bandwidth reduction for large vectors
+
+#### Level 4: Adaptive Strategy Selection
+Automatic optimization strategy based on vector characteristics:
+- **Small vectors (<512)**: `StrategyPureBLAS` - minimal overhead
+- **Medium vectors (512-4096)**: `StrategyFusion` - moderate kernel fusion
+- **Large vectors (≥4096)**: `StrategyHeavyFusion` - maximum optimization
+- **Pure Go**: All optimizations work without external dependencies
+
 ### API Surface (essentials)
 - `type Optimizer`: `.Step(params, grad)`, `.ResetState()`, `.CurrentStep()`.
 - `type Options`: `Alpha`, `Beta1`, `Beta2`, `Eps`, `WeightDecay` or `Norm *NormConfig`, `Schedule`.
 - `type NormConfig`: `LambdaNorm`, `BatchSize`, `DatasetSize`, `TotalEpochs`, `StepsPerEpoch`.
 - `type Schedule` and implementations: `FixedSchedule`, `CosineAnnealingWarmRestarts`.
+- Automatic optimization strategy selection based on vector size (no configuration needed).
 
 ### Testing & Benchmarks
 - Unit tests: `go test ./...`
 - Race detector: `go test -race ./...`
 - Fuzz tests: `go test -fuzz=FuzzStepStability -run ^$ -fuzztime=30s`
-- Benchmarks: `go test -bench . -benchmem`
+- Performance benchmarks: `go test -bench . -benchmem`
+- Strategy comparison: `go test -bench BenchmarkStrategyComparison -benchmem`
+- Adaptive selection: `go test -bench BenchmarkAdaptiveSelection -benchmem`
 
 ### Notes
 - Inputs must be finite; parameter/gradient lengths must match optimizer state.
