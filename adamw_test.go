@@ -70,7 +70,7 @@ func emulateOneStepManual(params, grad []float64, st *manualState,
 		vhat := st.v[i] / bc2
 
 		update := alpha * mhat / (math.Sqrt(vhat) + eps)
-		params[i] -= eta*update + eta*lambda*params[i]
+		params[i] -= eta*update + eta*alpha*lambda*params[i]
 	}
 }
 
@@ -153,8 +153,8 @@ func TestAdamW_ZeroGrad_PureDecoupledDecay(t *testing.T) {
 		}
 	}
 
-	// Expectation: θ * (1 - ηλ)^steps
-	f := math.Pow(1.0-eta*lambda, steps)
+	// Expectation: θ * (1 - η*α*λ)^steps
+	f := math.Pow(1.0-eta*alpha*lambda, steps)
 	want := []float64{
 		params[0] * f,
 		params[1] * f,
@@ -210,7 +210,7 @@ func TestAdamW_Normalization_NoRestarts(t *testing.T) {
 	lambda := lambdaNorm * math.Sqrt(float64(batch)/(float64(data)*float64(T)))
 	f := 1.0
 	for i := 0; i < steps; i++ {
-		f *= (1.0 - eta*lambda)
+		f *= (1.0 - eta*alpha*lambda)
 	}
 	want := []float64{params[0] * f, params[1] * f}
 	if !slicesAlmostEqual(libParams, want, 1e-12, 1e-10) {
@@ -284,7 +284,7 @@ func TestAdamWR_Normalization_WithWarmRestarts_Cosine(t *testing.T) {
 		}
 		lambda := lambdaNorm * math.Sqrt(float64(batch)/(float64(data)*Ti))
 		eta := sched2.Eta()
-		expected *= (1.0 - eta*lambda) // zero gradient => pure decay with η_t
+		expected *= (1.0 - eta*alpha*lambda) // zero gradient => pure decay with η_t
 
 		sched2.Tick()
 	}
@@ -557,8 +557,8 @@ func TestDecayMask_DisablesWeightDecayPerIndex(t *testing.T) {
 		}
 	}
 
-	// For indices with decay enabled: θ *= (1 - ηλ)^steps
-	f := math.Pow(1.0-eta*lambda, float64(steps))
+	// For indices with decay enabled: θ *= (1 - η*α*λ)^steps
+	f := math.Pow(1.0-eta*alpha*lambda, float64(steps))
 	want := []float64{
 		params0[0] * f, // decayed
 		params0[1],     // NOT decayed due to mask=false

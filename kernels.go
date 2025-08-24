@@ -94,13 +94,16 @@ func stepPureBLAS(o *Optimizer, params, grad []float64, eta, lambda, bc1, bc2 fl
 	elementWiseDivide(o.update, o.mhat, o.vhat)
 
 	// Step 5: Parameter updates
+	lr := o.Alpha * eta
 	if lambda > 0 {
 		if o.DecayMask == nil {
-			etaLambda := eta * lambda
+			// UNIFORM DECAY: use full lr = alpha * eta
+			etaLambda := lr * lambda
 			scaleVector(1.0-etaLambda, params)
-			axpyVector(-eta, o.update, params)
+			axpyVector(-eta, o.update, params) // update already scaled by alpha
 		} else {
-			etaLambda := eta * lambda
+			// MASKED DECAY
+			etaLambda := lr * lambda
 			for i := range o.decayUpdate {
 				if o.DecayMask[i] {
 					o.decayUpdate[i] = etaLambda * params[i]
@@ -136,14 +139,17 @@ func stepFusion(o *Optimizer, params, grad []float64, eta, lambda, bc1, bc2 floa
 	scaleVector(o.Alpha, o.mhat)
 	elementWiseDivide(o.update, o.mhat, o.vhat)
 
-	// Step 5: Parameter updates (same as pure BLAS)
+	// Step 5: Parameter updates
+	lr := o.Alpha * eta
 	if lambda > 0 {
 		if o.DecayMask == nil {
-			etaLambda := eta * lambda
+			// UNIFORM DECAY: use full lr = alpha * eta
+			etaLambda := lr * lambda
 			scaleVector(1.0-etaLambda, params)
-			axpyVector(-eta, o.update, params)
+			axpyVector(-eta, o.update, params) // update already scaled by alpha
 		} else {
-			etaLambda := eta * lambda
+			// MASKED DECAY
+			etaLambda := lr * lambda
 			for i := range o.decayUpdate {
 				if o.DecayMask[i] {
 					o.decayUpdate[i] = etaLambda * params[i]
@@ -210,23 +216,23 @@ func adaptiveUpdateCompleteFusion(update, mhat, vhat []float64, alpha, eps float
 }
 
 // parameterUpdateFusion performs adaptive update + weight decay + parameter update in one kernel:
-// if decay: params[i] = params[i]*(1-eta*lambda) - eta*update[i]  (with optional mask)
+// if decay: params[i] = params[i]*(1-alpha*eta*lambda) - eta*update[i]  (with optional mask)
 // else:     params[i] = params[i] - eta*update[i]
 // Reduces memory traffic by combining parameter update operations
-func parameterUpdateFusion(params, update []float64, eta, lambda float64, decayMask []bool) {
+func parameterUpdateFusion(params, update []float64, eta, alpha, lambda float64, decayMask []bool) {
+	lrDecay := eta * alpha * lambda
 	if lambda > 0 {
-		etaLambda := eta * lambda
 		if decayMask == nil {
 			// Uniform decay
-			oneMinusDecay := 1.0 - etaLambda
+			oneMinusDecay := 1.0 - lrDecay
 			for i := range params {
-				params[i] = params[i]*oneMinusDecay - eta*update[i]
+				params[i] = params[i]*oneMinusDecay - eta*update[i] // update already scaled by alpha
 			}
 		} else {
 			// Selective decay with mask
 			for i := range params {
 				if decayMask[i] {
-					params[i] = params[i]*(1.0-etaLambda) - eta*update[i]
+					params[i] = params[i]*(1.0-lrDecay) - eta*update[i]
 				} else {
 					params[i] = params[i] - eta*update[i]
 				}
@@ -256,7 +262,7 @@ func stepHeavyFusion(o *Optimizer, params, grad []float64, eta, lambda, bc1, bc2
 
 	// Step 3: Fused parameter update with decay
 	// This replaces separate decay and parameter update operations
-	parameterUpdateFusion(params, o.update, eta, lambda, o.DecayMask)
+	parameterUpdateFusion(params, o.update, eta, o.Alpha, lambda, o.DecayMask)
 
 	return nil
 }

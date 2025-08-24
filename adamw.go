@@ -40,8 +40,8 @@ type Optimizer struct {
 	WeightDecay float64
 	Norm        *NormConfig
 
-	// Optional mask to disable decay for certain parameters (e.g., bias/LayerNorm).
-	// If nil, decay applies to all parameters. If non-nil, its length must equal len(params).
+	// Optional mask to apply decay for certain parameters (e.g., weights but not bias/LayerNorm).
+	// If nil, decay applies to all parameters. If non-nil, DecayMask[i] == true means apply decay to params[i].
 	DecayMask []bool
 
 	// Schedule multiplier η_t
@@ -167,7 +167,7 @@ type Options struct {
 	WeightDecay float64
 	Norm        *NormConfig
 	Schedule    Schedule
-	DecayMask   []bool // optional; if provided, must match params length
+	DecayMask   []bool // optional; if provided, DecayMask[i] == true means apply decay to params[i]
 }
 
 func New(params []float64, opt Options) (*Optimizer, error) {
@@ -338,6 +338,7 @@ func (o *Optimizer) Step(params, grad []float64) error {
 
 	eta := o.Schedule.Eta()
 	// Note: if eta<=0, neither gradient nor decay is applied (consistent with cosine minima).
+	// The check eta < 0 ensures eta = 0 for negative values.
 	if eta < 0 {
 		eta = 0
 	}
