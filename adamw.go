@@ -22,6 +22,8 @@ package adamw
 import (
 	"errors"
 	"math"
+
+	"gonum.org/v1/gonum/floats"
 )
 
 // Optimizer implements AdamW/AdamWR for an in-place updated parameter vector θ.
@@ -50,6 +52,9 @@ type Optimizer struct {
 	powBeta1 float64
 	powBeta2 float64
 	m, v     []float64
+
+	// Working buffers to avoid allocations
+	mhat, vhat, update, decayUpdate []float64
 
 	initCalled bool
 }
@@ -180,6 +185,12 @@ func New(params []float64, opt Options) (*Optimizer, error) {
 		powBeta2:    1.0,
 		m:           make([]float64, len(params)),
 		v:           make([]float64, len(params)),
+
+		// Pre-allocate working buffers
+		mhat:        make([]float64, len(params)),
+		vhat:        make([]float64, len(params)),
+		update:      make([]float64, len(params)),
+		decayUpdate: make([]float64, len(params)),
 	}
 
 	// Defaults for betas if not provided (<=0): conventional values.
@@ -299,39 +310,70 @@ func (o *Optimizer) Step(params, grad []float64) error {
 
 	lambda := o.currentLambda()
 
-	for i := 0; i < len(params); i++ {
-		g := grad[i]
+	// Step 1: Update moments using vectorized operations
+	// m_t = β1 * m_{t-1} + (1-β1) * g_t
+	floats.Scale(o.Beta1, o.m)
+	floats.AddScaled(o.m, 1.0-o.Beta1, grad)
 
-		// m_t = β1 m_{t-1} + (1-β1) g_t
-		o.m[i] = o.Beta1*o.m[i] + (1.0-o.Beta1)*g
-		// v_t = β2 v_{t-1} + (1-β2) g_t^2
-		o.v[i] = o.Beta2*o.v[i] + (1.0-o.Beta2)*(g*g)
+	// v_t = β2 * v_{t-1} + (1-β2) * g_t^2
+	// Compute g^2 into vhat temporarily, then use for v update
+	copy(o.vhat, grad)
+	for i := range o.vhat {
+		o.vhat[i] *= o.vhat[i] // g^2 in-place
+	}
 
-		// \hat m_t, \hat v_t with soft clamp on vhat
-		mhat := o.m[i] / bc1
-		vhat := o.v[i] / bc2
-		if vhat < 0 {
-			vhat = 0 // soft clamp against tiny negative due to rounding
+	floats.Scale(o.Beta2, o.v)
+	floats.AddScaled(o.v, 1.0-o.Beta2, o.vhat)
+
+	// Step 2: Bias correction (fully vectorized)
+	// mhat = m / bc1, vhat = v / bc2
+	copy(o.mhat, o.m)
+	copy(o.vhat, o.v)
+	floats.Scale(1.0/bc1, o.mhat) // mhat = m / bc1
+	floats.Scale(1.0/bc2, o.vhat) // vhat = v / bc2
+
+	// Step 3: Soft clamp vhat and compute sqrt(vhat) + eps in single pass
+	for i := range o.vhat {
+		if o.vhat[i] < 0 {
+			o.vhat[i] = 0
 		}
-
-		den := math.Sqrt(vhat) + o.Eps
-		if !(den > 0 && isFinite(den)) {
+		o.vhat[i] = math.Sqrt(o.vhat[i]) + o.Eps
+		if !(o.vhat[i] > 0 && isFinite(o.vhat[i])) {
 			return errors.New("invalid adaptive denominator (sqrt(vhat)+eps)")
 		}
+	}
 
-		// Adaptive step
-		update := o.Alpha * mhat / den
+	// Step 4: Compute adaptive update = alpha * mhat / (sqrt(vhat) + eps)
+	floats.Scale(o.Alpha, o.mhat) // mhat = alpha * mhat
 
-		// Decoupled weight decay (Algorithm 2, step 12), optionally masked
-		decayTerm := 0.0
-		if lambda > 0 {
-			if o.DecayMask == nil || o.DecayMask[i] {
-				decayTerm = eta * lambda * params[i]
+	// Vectorized element-wise division: update = mhat / vhat
+	floats.DivTo(o.update, o.mhat, o.vhat)
+
+	// Step 5: Apply updates to parameters (fully vectorized)
+	// θ <- θ - η_t * update - η_t * λ * θ (with optional DecayMask)
+	if lambda > 0 {
+		if o.DecayMask == nil {
+			// Simple case: uniform weight decay, fully vectorized
+			etaLambda := eta * lambda
+			floats.Scale(1.0-etaLambda, params)      // params *= (1 - η*λ)
+			floats.AddScaled(params, -eta, o.update) // params -= η * update
+		} else {
+			// Complex case: selective weight decay with mask
+			// Create decay vector based on mask
+			etaLambda := eta * lambda
+			for i := range o.decayUpdate {
+				if o.DecayMask[i] {
+					o.decayUpdate[i] = etaLambda * params[i]
+				} else {
+					o.decayUpdate[i] = 0
+				}
 			}
+			floats.Sub(params, o.decayUpdate)        // params -= decay_term
+			floats.AddScaled(params, -eta, o.update) // params -= η * update
 		}
-
-		// θ <- θ - η_t * update - decayTerm
-		params[i] -= eta*update + decayTerm
+	} else {
+		// No weight decay, pure vectorized update
+		floats.AddScaled(params, -eta, o.update) // params -= eta * update
 	}
 
 	o.Schedule.Tick()
@@ -346,6 +388,10 @@ func (o *Optimizer) ResetState() {
 	for i := range o.m {
 		o.m[i] = 0
 		o.v[i] = 0
+		o.mhat[i] = 0
+		o.vhat[i] = 0
+		o.update[i] = 0
+		o.decayUpdate[i] = 0
 	}
 	o.t = 0
 	o.powBeta1 = 1.0

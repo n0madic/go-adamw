@@ -10,6 +10,7 @@ AdamW / AdamWR optimizer for Go (float64 vectors) with decoupled weight decay, b
 - Schedules: fixed multiplier or cosine annealing with warm restarts.
 - Normalized weight decay (Appendix B.1) via `NormConfig`.
 - Deterministic updates; resettable state for reproducibility.
+- Gonum-optimized vectorized operations for large parameter vectors.
 
 ### Install
 ```
@@ -22,12 +23,18 @@ package main
 
 import (
     "fmt"
+    "math"
+
     adamw "github.com/n0madic/go-adamw"
+    "gonum.org/v1/gonum/floats"
 )
 
 func main() {
     // Parameters θ we update in-place
-    params := []float64{0.5, -1.0, 2.0}
+    params := make([]float64, 1024) // Large vector to trigger gonum optimization
+    for i := range params {
+        params[i] = 0.1 * math.Sin(float64(i))
+    }
 
     opt, err := adamw.New(params, adamw.Options{
         Alpha:       1e-3,     // base lr
@@ -36,6 +43,7 @@ func main() {
         Eps:         1e-8,
         WeightDecay: 1e-2,     // decoupled λ; set <0 to disable
         Schedule:    adamw.NewFixedSchedule(1.0, 0), // η_t ≡ 1
+        // UseGonum and VectorThreshold are optional - auto-detected by default
     })
     if err != nil { panic(err) }
 
@@ -45,7 +53,7 @@ func main() {
         for i := range params { grad[i] = 2 * params[i] }
         if err := opt.Step(params, grad); err != nil { panic(err) }
     }
-    fmt.Printf("params: %#v\n", params)
+    fmt.Printf("final norm: %g\n", math.Sqrt(floats.Dot(params, params)))
 }
 ```
 Run the example in this repo: `go run ./example`.
