@@ -568,3 +568,310 @@ func TestDecayMask_DisablesWeightDecayPerIndex(t *testing.T) {
 		t.Fatalf("mask decay mismatch:\ngot:  %#v\nwant: %#v", params, want)
 	}
 }
+
+// TestWeightDecayAlphaScaling_SanityCheck verifies the basic weight decay formula
+// with alpha scaling: θ₁ = θ₀ * (1 - α*η*λ)
+func TestWeightDecayAlphaScaling_SanityCheck(t *testing.T) {
+	t.Parallel()
+
+	// Sanity case: θ₀=1, g=0, λ=0.1, α=0.01, η=1 ⇒ θ₁=0.999
+	params := []float64{1.0}
+	grad := []float64{0.0} // zero gradient to isolate decay effect
+
+	alpha := 0.01
+	lambda := 0.1
+	eta := 1.0
+
+	opt, err := New(params, Options{
+		Alpha:       alpha,
+		Beta1:       0.9,
+		Beta2:       0.999,
+		Eps:         1e-8,
+		WeightDecay: lambda,
+		Schedule:    NewFixedSchedule(eta, 0),
+	})
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	// Perform one step
+	if err := opt.Step(params, grad); err != nil {
+		t.Fatalf("Step error: %v", err)
+	}
+
+	// Expected: θ₁ = 1.0 * (1 - 0.01*1.0*0.1) = 1.0 * (1 - 0.001) = 0.999
+	expected := 0.999
+	if math.Abs(params[0]-expected) > 1e-12 {
+		t.Fatalf("Alpha scaling sanity check failed:\ngot:      %.15f\nexpected: %.15f\ndiff:     %.2e",
+			params[0], expected, math.Abs(params[0]-expected))
+	}
+}
+
+// TestWeightDecayMask_SelectiveApplication verifies that DecayMask works correctly
+// with alpha scaling: decay only where mask[i] == true
+func TestWeightDecayMask_SelectiveApplication(t *testing.T) {
+	t.Parallel()
+
+	// DecayMask=[false,true], g=0 ⇒ decay only in second coordinate
+	params := []float64{2.0, 3.0}
+	grad := []float64{0.0, 0.0} // zero gradients
+	mask := []bool{false, true} // decay disabled for first param, enabled for second
+
+	alpha := 0.01
+	lambda := 0.1
+	eta := 1.0
+
+	opt, err := New(params, Options{
+		Alpha:       alpha,
+		Beta1:       0.9,
+		Beta2:       0.999,
+		Eps:         1e-8,
+		WeightDecay: lambda,
+		Schedule:    NewFixedSchedule(eta, 0),
+		DecayMask:   mask,
+	})
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	originalParams := []float64{params[0], params[1]}
+
+	// Perform one step
+	if err := opt.Step(params, grad); err != nil {
+		t.Fatalf("Step error: %v", err)
+	}
+
+	// Expected results:
+	// params[0]: no decay (mask=false) ⇒ should remain unchanged = 2.0
+	// params[1]: with decay (mask=true) ⇒ 3.0 * (1 - 0.01*1.0*0.1) = 3.0 * 0.999 = 2.997
+	expectedFirst := originalParams[0] // unchanged
+	expectedSecond := originalParams[1] * (1.0 - alpha*eta*lambda)
+
+	if math.Abs(params[0]-expectedFirst) > 1e-12 {
+		t.Fatalf("Masked decay failed for index 0 (should be unchanged):\ngot:      %.15f\nexpected: %.15f",
+			params[0], expectedFirst)
+	}
+
+	if math.Abs(params[1]-expectedSecond) > 1e-12 {
+		t.Fatalf("Masked decay failed for index 1 (should be decayed):\ngot:      %.15f\nexpected: %.15f\ndiff:     %.2e",
+			params[1], expectedSecond, math.Abs(params[1]-expectedSecond))
+	}
+}
+
+// TestWeightDecayB1_TotalEpochsScaling verifies B.1 normalization:
+// when T is doubled, λ decreases as 1/√2
+func TestWeightDecayB1_TotalEpochsScaling(t *testing.T) {
+	t.Parallel()
+
+	// Test parameters for normalization effect isolation
+
+	alpha := 0.001
+	eta := 1.0
+	lambdaNorm := 0.1
+	batch := 32
+	data := 1000
+
+	// Test with T=10 epochs
+	T1 := 10
+	opt1, err := New([]float64{1.0}, Options{
+		Alpha: alpha,
+		Beta1: 0.9, Beta2: 0.999, Eps: 1e-8,
+		Norm: &NormConfig{
+			LambdaNorm:  lambdaNorm,
+			BatchSize:   batch,
+			DatasetSize: data,
+			TotalEpochs: T1,
+		},
+		Schedule: NewFixedSchedule(eta, 0),
+	})
+	if err != nil {
+		t.Fatalf("New opt1 error: %v", err)
+	}
+
+	// Test with T=20 epochs (doubled)
+	T2 := 20
+	opt2, err := New([]float64{1.0}, Options{
+		Alpha: alpha,
+		Beta1: 0.9, Beta2: 0.999, Eps: 1e-8,
+		Norm: &NormConfig{
+			LambdaNorm:  lambdaNorm,
+			BatchSize:   batch,
+			DatasetSize: data,
+			TotalEpochs: T2,
+		},
+		Schedule: NewFixedSchedule(eta, 0),
+	})
+	if err != nil {
+		t.Fatalf("New opt2 error: %v", err)
+	}
+
+	// Calculate expected λ values using B.1 formula: λ = λ_norm * sqrt(b / (B * T))
+	lambda1 := lambdaNorm * math.Sqrt(float64(batch)/(float64(data)*float64(T1)))
+	lambda2 := lambdaNorm * math.Sqrt(float64(batch)/(float64(data)*float64(T2)))
+
+	// Verify that λ₂/λ₁ = 1/√2 when T₂ = 2*T₁
+	expectedRatio := 1.0 / math.Sqrt(2.0)
+	actualRatio := lambda2 / lambda1
+
+	if math.Abs(actualRatio-expectedRatio) > 1e-12 {
+		t.Fatalf("B.1 scaling verification failed:\nλ₁: %.12f\nλ₂: %.12f\nratio: %.12f\nexpected ratio: %.12f",
+			lambda1, lambda2, actualRatio, expectedRatio)
+	}
+
+	// Verify that the optimizers actually use these computed λ values
+	// by checking internal currentLambda() results
+	computedLambda1 := opt1.currentLambda()
+	computedLambda2 := opt2.currentLambda()
+
+	if math.Abs(computedLambda1-lambda1) > 1e-12 {
+		t.Fatalf("Optimizer 1 lambda mismatch: got %.12f, expected %.12f", computedLambda1, lambda1)
+	}
+
+	if math.Abs(computedLambda2-lambda2) > 1e-12 {
+		t.Fatalf("Optimizer 2 lambda mismatch: got %.12f, expected %.12f", computedLambda2, lambda2)
+	}
+}
+
+// TestWeightDecayB1_WarmRestarts verifies B.1 normalization with warm restarts:
+// T should be taken as the length of the current restart period
+func TestWeightDecayB1_WarmRestarts(t *testing.T) {
+	t.Parallel()
+
+	// Test parameters for warm restart normalization
+
+	alpha := 0.001
+	lambdaNorm := 0.1
+	batch := 32
+	data := 1000
+	stepsPerEpoch := 10
+	initialPeriod := 20 // steps = 2 epochs
+	tMult := 2.0
+
+	schedule, err := NewCosineAnnealingWarmRestarts(initialPeriod, tMult)
+	if err != nil {
+		t.Fatalf("Schedule creation error: %v", err)
+	}
+
+	opt, err := New([]float64{1.0}, Options{
+		Alpha: alpha,
+		Beta1: 0.9, Beta2: 0.999, Eps: 1e-8,
+		Norm: &NormConfig{
+			LambdaNorm:    lambdaNorm,
+			BatchSize:     batch,
+			DatasetSize:   data,
+			StepsPerEpoch: stepsPerEpoch,
+			TotalEpochs:   0, // not used with restarts
+		},
+		Schedule: schedule,
+	})
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	// At the beginning of first period, T should be initialPeriod/stepsPerEpoch = 2 epochs
+	periodSteps, hasRestarts := opt.Schedule.PeriodInfo()
+	if !hasRestarts {
+		t.Fatalf("Expected warm restarts, got hasRestarts=false")
+	}
+
+	expectedPeriodSteps := initialPeriod
+	if periodSteps != expectedPeriodSteps {
+		t.Fatalf("Initial period mismatch: got %d steps, expected %d", periodSteps, expectedPeriodSteps)
+	}
+
+	// Verify lambda calculation uses current period length
+	Ti := float64(periodSteps) / float64(stepsPerEpoch) // 20/10 = 2 epochs
+	expectedLambda := lambdaNorm * math.Sqrt(float64(batch)/(float64(data)*Ti))
+	actualLambda := opt.currentLambda()
+
+	if math.Abs(actualLambda-expectedLambda) > 1e-12 {
+		t.Fatalf("Warm restart lambda mismatch:\ngot:      %.12f\nexpected: %.12f\nperiod:   %d steps (%.1f epochs)",
+			actualLambda, expectedLambda, periodSteps, Ti)
+	}
+}
+
+// TestWeightDecayCorrectness_AllStrategies verifies that all optimization strategies
+// (PureBLAS, Fusion, HeavyFusion) produce identical results with alpha scaling
+func TestWeightDecayCorrectness_AllStrategies(t *testing.T) {
+	t.Parallel()
+
+	params0 := []float64{1.5, -2.5, 0.8} // base parameter values
+
+	alpha := 0.005
+	lambda := 0.05
+	eta := 1.0
+
+	// Create optimizers for different vector sizes to trigger different strategies
+	testCases := []struct {
+		name       string
+		vectorSize int
+		strategy   OptimizationStrategy
+	}{
+		{"Small/PureBLAS", 100, StrategyPureBLAS},
+		{"Medium/Fusion", 2000, StrategyFusion},
+		{"Large/HeavyFusion", 8000, StrategyHeavyFusion},
+	}
+
+	var results [][]float64
+
+	for _, tc := range testCases {
+		// Create parameter vector of the specified size, filled with test values repeated
+		params := make([]float64, tc.vectorSize)
+		gradients := make([]float64, tc.vectorSize)
+		for i := 0; i < tc.vectorSize; i++ {
+			params[i] = params0[i%len(params0)]
+			gradients[i] = 0.0 // zero gradient
+		}
+
+		opt, err := New(params, Options{
+			Alpha:       alpha,
+			Beta1:       0.9,
+			Beta2:       0.999,
+			Eps:         1e-8,
+			WeightDecay: lambda,
+			Schedule:    NewFixedSchedule(eta, 0),
+		})
+		if err != nil {
+			t.Fatalf("New error for %s: %v", tc.name, err)
+		}
+
+		// Verify the strategy was selected correctly
+		if opt.strategy != tc.strategy {
+			t.Fatalf("Strategy mismatch for %s: got %v, expected %v",
+				tc.name, opt.strategy, tc.strategy)
+		}
+
+		// Perform one step
+		if err := opt.Step(params, gradients); err != nil {
+			t.Fatalf("Step error for %s: %v", tc.name, err)
+		}
+
+		// Store results for first few parameters for comparison
+		result := make([]float64, len(params0))
+		copy(result, params[:len(params0)])
+		results = append(results, result)
+	}
+
+	// All strategies should produce identical results
+	tolerance := 1e-12
+	for i := 1; i < len(results); i++ {
+		for j := 0; j < len(params0); j++ {
+			if math.Abs(results[i][j]-results[0][j]) > tolerance {
+				t.Fatalf("Strategy mismatch at param %d:\n%s: %.15f\n%s: %.15f\ndiff: %.2e",
+					j, testCases[0].name, results[0][j],
+					testCases[i].name, results[i][j],
+					math.Abs(results[i][j]-results[0][j]))
+			}
+		}
+	}
+
+	// Verify the decay formula: θ₁ = θ₀ * (1 - α*η*λ)
+	expectedFactor := 1.0 - alpha*eta*lambda
+	for j := 0; j < len(params0); j++ {
+		expected := params0[j] * expectedFactor
+		if math.Abs(results[0][j]-expected) > tolerance {
+			t.Fatalf("Alpha scaling formula verification failed at param %d:\ngot:      %.15f\nexpected: %.15f\nfactor:   %.15f",
+				j, results[0][j], expected, expectedFactor)
+		}
+	}
+}
