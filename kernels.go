@@ -266,3 +266,167 @@ func stepHeavyFusion(o *Optimizer, params, grad []float64, eta, lambda, bc1, bc2
 
 	return nil
 }
+
+// stepMatrixPureBLAS implements matrix-optimized pure BLAS strategy without flattening
+func stepMatrixPureBLAS(o *Optimizer, paramView, gradView *MatrixView, eta, lambda, bc1, bc2 float64) error {
+	// Step 1: Moment updates using MatrixView (avoiding BLAS for this part)
+	gradView.ForEach(func(i int, gi float64) {
+		o.m[i] = o.Beta1*o.m[i] + (1.0-o.Beta1)*gi
+		o.v[i] = o.Beta2*o.v[i] + (1.0-o.Beta2)*gi*gi
+	})
+
+	// Step 2: Bias correction
+	copyVector(o.m, o.mhat)
+	copyVector(o.v, o.vhat)
+	scaleVector(1.0/bc1, o.mhat)
+	scaleVector(1.0/bc2, o.vhat)
+
+	// Step 3: Sqrt with clamp
+	if err := clampSqrtAddEps(o.vhat, o.Eps); err != nil {
+		return err
+	}
+
+	// Step 4: Adaptive update computation
+	scaleVector(o.Alpha, o.mhat)
+	elementWiseDivide(o.update, o.mhat, o.vhat)
+
+	// Step 5: Parameter updates directly on matrices
+	lr := o.Alpha * eta
+	if lambda > 0 {
+		if o.DecayMask == nil {
+			// Uniform decay
+			etaLambda := lr * lambda
+			oneMinusDecay := 1.0 - etaLambda
+			paramView.ForEachMutable(func(i int, paramPtr *float64) {
+				*paramPtr = (*paramPtr)*oneMinusDecay - eta*o.update[i] // update already scaled by alpha
+			})
+		} else {
+			// Selective decay with mask
+			etaLambda := lr * lambda
+			paramView.ForEachMutable(func(i int, paramPtr *float64) {
+				if o.DecayMask[i] {
+					*paramPtr = (*paramPtr)*(1.0-etaLambda) - eta*o.update[i]
+				} else {
+					*paramPtr = (*paramPtr) - eta*o.update[i]
+				}
+			})
+		}
+	} else {
+		// No decay - simple update
+		paramView.ForEachMutable(func(i int, paramPtr *float64) {
+			*paramPtr = (*paramPtr) - eta*o.update[i]
+		})
+	}
+
+	return nil
+}
+
+// ---------- Matrix-optimized kernels for zero-copy operations ----------
+
+// momentUpdateFusionMatrix performs fused moment updates directly on matrix data:
+// m[i] = beta1*m[i] + (1-beta1)*g[i]
+// v[i] = beta2*v[i] + (1-beta2)*g[i]^2
+// This version works directly with MatrixView without copying data
+func momentUpdateFusionMatrix(m, v []float64, gradView *MatrixView, beta1, beta2 float64) {
+	oneMinusBeta1 := 1.0 - beta1
+	oneMinusBeta2 := 1.0 - beta2
+
+	gradView.ForEach(func(i int, gi float64) {
+		m[i] = beta1*m[i] + oneMinusBeta1*gi
+		v[i] = beta2*v[i] + oneMinusBeta2*gi*gi
+	})
+}
+
+// fullMomentBiasFusionMatrix performs moment updates with immediate bias correction on matrix data:
+// mhat[i] = (beta1*m[i] + (1-beta1)*g[i]) / bc1
+// vhat[i] = (beta2*v[i] + (1-beta2)*g[i]^2) / bc2
+func fullMomentBiasFusionMatrix(m, v, mhat, vhat []float64, gradView *MatrixView, beta1, beta2, bc1, bc2 float64) {
+	oneMinusBeta1 := 1.0 - beta1
+	oneMinusBeta2 := 1.0 - beta2
+	invBC1 := 1.0 / bc1
+	invBC2 := 1.0 / bc2
+
+	gradView.ForEach(func(i int, gi float64) {
+		gi2 := gi * gi
+
+		// Update moments and immediately apply bias correction
+		m[i] = beta1*m[i] + oneMinusBeta1*gi
+		v[i] = beta2*v[i] + oneMinusBeta2*gi2
+
+		// Bias-corrected moments ready for use
+		mhat[i] = m[i] * invBC1
+		vhat[i] = v[i] * invBC2
+	})
+}
+
+// parameterUpdateFusionMatrix performs adaptive update + weight decay + parameter update directly on matrices:
+// if decay: params[i] = params[i]*(1-alpha*eta*lambda) - eta*update[i]  (with optional mask)
+// else:     params[i] = params[i] - eta*update[i]
+func parameterUpdateFusionMatrix(paramView *MatrixView, update []float64, eta, alpha, lambda float64, decayMask []bool) {
+	lrDecay := eta * alpha * lambda
+	if lambda > 0 {
+		if decayMask == nil {
+			// Uniform decay
+			oneMinusDecay := 1.0 - lrDecay
+			paramView.ForEachMutable(func(i int, paramPtr *float64) {
+				*paramPtr = (*paramPtr)*oneMinusDecay - eta*update[i] // update already scaled by alpha
+			})
+		} else {
+			// Selective decay with mask
+			paramView.ForEachMutable(func(i int, paramPtr *float64) {
+				if decayMask[i] {
+					*paramPtr = (*paramPtr)*(1.0-lrDecay) - eta*update[i]
+				} else {
+					*paramPtr = (*paramPtr) - eta*update[i]
+				}
+			})
+		}
+	} else {
+		// No decay - simple update
+		paramView.ForEachMutable(func(i int, paramPtr *float64) {
+			*paramPtr = (*paramPtr) - eta*update[i]
+		})
+	}
+}
+
+// stepMatrixFusion implements matrix-optimized fusion strategy without data copying
+func stepMatrixFusion(o *Optimizer, paramView, gradView *MatrixView, eta, lambda, bc1, bc2 float64) error {
+	// Step 1: Fused moment updates directly on matrix data
+	momentUpdateFusionMatrix(o.m, o.v, gradView, o.Beta1, o.Beta2)
+
+	// Step 2: Bias correction for m (separate, since it doesn't need sqrt)
+	copyVector(o.m, o.mhat)
+	scaleVector(1.0/bc1, o.mhat)
+
+	// Step 3: Fused bias correction + clamp + sqrt for v
+	if err := biasCorrectClampSqrtFusion(o.vhat, o.v, bc2, o.Eps); err != nil {
+		return err
+	}
+
+	// Step 4: Adaptive update computation
+	scaleVector(o.Alpha, o.mhat)
+	elementWiseDivide(o.update, o.mhat, o.vhat)
+
+	// Step 5: Parameter updates directly on matrix data
+	parameterUpdateFusionMatrix(paramView, o.update, eta, o.Alpha, lambda, o.DecayMask)
+
+	return nil
+}
+
+// stepMatrixHeavyFusion implements matrix-optimized heavy fusion strategy
+func stepMatrixHeavyFusion(o *Optimizer, paramView, gradView *MatrixView, eta, lambda, bc1, bc2 float64) error {
+	// Heavy fusion approach: minimize memory passes for large vectors
+
+	// Step 1: Fused moment updates with immediate bias correction directly on matrix data
+	fullMomentBiasFusionMatrix(o.m, o.v, o.mhat, o.vhat, gradView, o.Beta1, o.Beta2, bc1, bc2)
+
+	// Step 2: Complete adaptive update fusion
+	if err := adaptiveUpdateCompleteFusion(o.update, o.mhat, o.vhat, o.Alpha, o.Eps); err != nil {
+		return err
+	}
+
+	// Step 3: Fused parameter update with decay directly on matrix data
+	parameterUpdateFusionMatrix(paramView, o.update, eta, o.Alpha, lambda, o.DecayMask)
+
+	return nil
+}

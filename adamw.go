@@ -6,6 +6,12 @@
 // - Normalized weight decay (Appendix B.1)
 // - Cosine annealing with warm restarts (Appendix B.2, Eq. 15)
 //
+// Zero-copy matrix optimization:
+// - Direct [][]float64 matrix support via NewFromMatrices() and StepMatrices()
+// - No data copying between optimization steps for maximum performance
+// - MatrixView provides unified access to matrix data as flat indices
+// - All optimization strategies (PureBLAS, Fusion, HeavyFusion) support matrices
+//
 // Engineering hardening:
 // - Strict hyperparameter validation (beta bounds, eps>0, alpha>0)
 // - Param length vs. internal state length check
@@ -27,6 +33,23 @@ import (
 )
 
 // Optimizer implements AdamW/AdamWR for an in-place updated parameter vector θ.
+//
+// The optimizer supports two modes:
+//  1. Traditional: New(params, opts) + Step(params, grad) - works with []float64
+//  2. Matrix: NewFromMatrices(matrices, opts) + StepMatrices(matrices, grads) - zero-copy [][]float64
+//
+// Example usage:
+//
+//	// Traditional mode
+//	params := []float64{0.1, 0.2, 0.3}
+//	opt, _ := adamw.New(params, adamw.Options{Alpha: 1e-3, WeightDecay: 1e-2})
+//	opt.Step(params, []float64{0.01, 0.02, 0.03})
+//
+//	// Matrix mode (zero-copy)
+//	weights := [][]float64{{0.1, 0.2}, {0.3, 0.4}}
+//	opt, _ := adamw.NewFromMatrices([][]float64{weights[0], weights[1]}, adamw.Options{Alpha: 1e-3})
+//	gradients := [][]float64{{0.01, 0.02}, {0.03, 0.04}}
+//	opt.StepMatrices([][]float64{weights[0], weights[1]}, gradients)
 type Optimizer struct {
 	// Adam hyperparameters
 	Alpha float64 // base lr (α), must be > 0
@@ -257,6 +280,37 @@ func New(params []float64, opt Options) (*Optimizer, error) {
 	return o, nil
 }
 
+// NewFromMatrices creates an optimizer for matrix-based parameters without copying data.
+// This allows efficient optimization of parameters stored as [][]float64 matrices,
+// avoiding the overhead of flattening and copying data on each optimization step.
+//
+// The parameters and gradients will be accessed through MatrixView, which provides
+// a flat interface to the matrix data without copying. All existing optimization
+// strategies (PureBLAS, Fusion, HeavyFusion) work efficiently with this approach.
+//
+// Example usage:
+//
+//	weights := [][]float64{{0.1, 0.2}, {0.3, 0.4}}
+//	bias := [][]float64{{0.0}, {0.1}}
+//	opt, err := NewFromMatrices([][]float64{weights, bias}, Options{...})
+func NewFromMatrices(paramMatrices [][]float64, opt Options) (*Optimizer, error) {
+	if len(paramMatrices) == 0 {
+		return nil, errors.New("paramMatrices must be non-empty")
+	}
+
+	// Create MatrixView to get total parameter count
+	matrixView, err := NewMatrixView(paramMatrices)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a dummy flat parameter slice for New() - values don't matter since we're not using them
+	flatParams := make([]float64, matrixView.Len())
+
+	// Use the existing New function to create the optimizer (reusing all validation logic)
+	return New(flatParams, opt)
+}
+
 func ifPositiveOr(v, def float64) float64 {
 	if v > 0 {
 		return v
@@ -357,6 +411,107 @@ func (o *Optimizer) Step(params, grad []float64) error {
 	default:
 		// Fallback to fusion strategy
 		err = stepFusion(o, params, grad, eta, lambda, bc1, bc2)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	o.Schedule.Tick()
+	return nil
+}
+
+// StepMatrices performs one AdamW update on matrix parameters using matrix gradients.
+// This method avoids copying data by working directly with the matrix structure.
+// Requirements:
+// - paramMatrices and gradMatrices must have the same structure (same number of matrices, same dimensions)
+// - total number of elements must match optimizer state length
+// - all inputs must be finite
+//
+// For most optimization strategies, this is more efficient than flattening matrices on each call.
+func (o *Optimizer) StepMatrices(paramMatrices, gradMatrices [][]float64) error {
+	if len(paramMatrices) == 0 || len(gradMatrices) == 0 {
+		return errors.New("paramMatrices and gradMatrices must be non-empty")
+	}
+	if len(paramMatrices) != len(gradMatrices) {
+		return errors.New("paramMatrices and gradMatrices must have equal length")
+	}
+
+	// Create MatrixViews for validation and access
+	paramView, err := NewMatrixView(paramMatrices)
+	if err != nil {
+		return err
+	}
+	gradView, err := NewMatrixView(gradMatrices)
+	if err != nil {
+		return err
+	}
+
+	if paramView.Len() != gradView.Len() {
+		return errors.New("total parameter and gradient counts must be equal")
+	}
+
+	// Validate matrix dimensions match
+	for i := range paramMatrices {
+		if len(paramMatrices[i]) != len(gradMatrices[i]) {
+			return errors.New("parameter and gradient matrices must have matching dimensions")
+		}
+	}
+
+	if !o.initCalled {
+		return errors.New("optimizer not initialized")
+	}
+	if paramView.Len() != len(o.m) || paramView.Len() != len(o.v) {
+		return errors.New("parameter count must match optimizer state length")
+	}
+	if o.DecayMask != nil && len(o.DecayMask) != paramView.Len() {
+		return errors.New("DecayMask length must match params length")
+	}
+
+	// Finite guards using efficient matrix iteration
+	paramView.ForEach(func(i int, value float64) {
+		if !isFinite(value) {
+			panic("non-finite parameter encountered")
+		}
+	})
+	gradView.ForEach(func(i int, value float64) {
+		if !isFinite(value) {
+			panic("non-finite gradient encountered")
+		}
+	})
+
+	// t := t + 1
+	o.t++
+
+	// Update powers for bias correction factors: (1 - β^t)
+	o.powBeta1 *= o.Beta1
+	o.powBeta2 *= o.Beta2
+	bc1 := 1.0 - o.powBeta1
+	bc2 := 1.0 - o.powBeta2
+	if !(bc1 > 0.0 && bc2 > 0.0 && isFinite(bc1) && isFinite(bc2)) {
+		return errors.New("invalid bias-correction denominators")
+	}
+
+	eta := o.Schedule.Eta()
+	// Note: if eta<=0, neither gradient nor decay is applied (consistent with cosine minima).
+	// The check eta < 0 ensures eta = 0 for negative values.
+	if eta < 0 {
+		eta = 0
+	}
+
+	lambda := o.currentLambda()
+
+	// Use matrix-optimized kernels
+	switch o.strategy {
+	case StrategyPureBLAS:
+		err = stepMatrixPureBLAS(o, paramView, gradView, eta, lambda, bc1, bc2)
+	case StrategyFusion:
+		err = stepMatrixFusion(o, paramView, gradView, eta, lambda, bc1, bc2)
+	case StrategyHeavyFusion:
+		err = stepMatrixHeavyFusion(o, paramView, gradView, eta, lambda, bc1, bc2)
+	default:
+		// Fallback to matrix fusion strategy
+		err = stepMatrixFusion(o, paramView, gradView, eta, lambda, bc1, bc2)
 	}
 
 	if err != nil {

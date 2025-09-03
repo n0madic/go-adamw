@@ -875,3 +875,48 @@ func TestWeightDecayCorrectness_AllStrategies(t *testing.T) {
 		}
 	}
 }
+
+// TestTotalEpochsZeroBug demonstrates a division by zero bug in currentLambda
+func TestTotalEpochsZeroBug(t *testing.T) {
+	t.Parallel()
+
+	// Create optimizer with TotalEpochs = 0, which should cause division by zero
+	params := []float64{1.0, 2.0}
+	grad := []float64{0.1, 0.2}
+
+	opt, err := New(params, Options{
+		Alpha: 1e-3,
+		Beta1: 0.9,
+		Beta2: 0.999,
+		Eps:   1e-8,
+		Norm: &NormConfig{
+			LambdaNorm:  0.1,
+			BatchSize:   32,
+			DatasetSize: 1000,
+			TotalEpochs: 0, // This should cause division by zero
+		},
+		Schedule: NewFixedSchedule(1.0, 0),
+	})
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	// This should cause a panic due to division by zero in currentLambda
+	defer func() {
+		if r := recover(); r != nil {
+			t.Logf("Panic occurred as expected: %v", r)
+		}
+	}()
+
+	// This call should trigger the division by zero
+	err = opt.Step(params, grad)
+	if err != nil {
+		t.Logf("Step error: %v", err)
+	}
+
+	// Check if currentLambda produces infinity (indicating division by zero)
+	lambda := opt.currentLambda()
+	if math.IsInf(lambda, 0) || math.IsNaN(lambda) {
+		t.Errorf("currentLambda returned invalid value: %v", lambda)
+	}
+}
